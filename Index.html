@@ -1,0 +1,877 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spider-Man Web Cursor</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 100%; height: 100%; overflow: hidden;
+        background: #000; cursor: none;
+      }
+      .bg {
+        position: fixed; inset: 0; z-index: 0;
+        background: radial-gradient(ellipse at 50% 35%, #0a0a14 0%, #04040a 45%, #000 100%);
+      }
+      .spider-bg {
+        position: fixed; top: -5%; left: -5%; width: 110%; height: 110%;
+        z-index: 1; background-image: url("bg2.jpg");
+        background-size: cover; background-position: center;
+        opacity: 0.99; pointer-events: none;
+        will-change: transform; transition: opacity 0.3s;
+      }
+      body.aura-active .spider-bg { opacity: 0.22; }
+      #c  { position: fixed; inset: 0; z-index: 10; pointer-events: none; }
+      #hd { position: fixed; inset: 0; z-index:  9; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div class="bg"></div>
+    <div class="spider-bg" id="tbg"></div>
+    <canvas id="hd"></canvas>
+    <canvas id="c"></canvas>
+    <script>
+    (function () {
+      "use strict";
+
+      const C    = document.getElementById("c");
+      const ctx  = C.getContext("2d");
+      const HD   = document.getElementById("hd");
+      const hctx = HD.getContext("2d");
+      const tbg  = document.getElementById("tbg");
+      let W, H, dpr;
+
+      function resize() {
+        dpr = Math.min(devicePixelRatio || 1, 2);
+        W = innerWidth; H = innerHeight;
+        C.width = W*dpr; C.height = H*dpr;
+        C.style.width = W+"px"; C.style.height = H+"px";
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+        HD.width = W*dpr; HD.height = H*dpr;
+        HD.style.width = W+"px"; HD.style.height = H+"px";
+        hctx.setTransform(dpr,0,0,dpr,0,0);
+      }
+      addEventListener("resize", resize); resize();
+
+      const lerp  = (a,b,t) => a+(b-a)*t;
+      const rand  = (a,b)   => a+Math.random()*(b-a);
+      const randi = (a,b)   => (a+Math.random()*(b-a))|0;
+      const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
+      const TAU   = Math.PI*2;
+      const hypot = Math.hypot;
+
+      /* ── Pointer ── */
+      const P = {
+        x: W/2, y: H/2, tx: W/2, ty: H/2,
+        px: W/2, py: H/2, vx: 0, vy: 0,
+        speed: 0, lastMove: 0, moving: false
+      };
+      function setTarget(x,y){
+        P.tx=x; P.ty=y; P.lastMove=performance.now();
+      }
+      addEventListener("mousemove", e => setTarget(e.clientX,e.clientY));
+      addEventListener("touchmove", e => {
+        if(e.touches.length) setTarget(e.touches[0].clientX,e.touches[0].clientY);
+      },{passive:true});
+      addEventListener("mousedown", e => {
+        document.body.classList.add("aura-active");
+        webShot(e.clientX,e.clientY);
+      });
+      addEventListener("mouseup",   () => document.body.classList.remove("aura-active"));
+      addEventListener("mouseleave", () => document.body.classList.remove("aura-active"));
+      addEventListener("touchstart", e => {
+        document.body.classList.add("aura-active");
+        if(e.touches.length){ setTarget(e.touches[0].clientX,e.touches[0].clientY); webShot(P.tx,P.ty); }
+      },{passive:true});
+      addEventListener("touchend", () => document.body.classList.remove("aura-active"));
+
+      /* ═══════════════════════════════════════════════════
+         WEB CURSOR DESIGN
+         A radial web anchored at cursor, with concentric rings
+         and radial spokes — all elastically animated.
+         
+         Structure:
+         - CENTER: anchor point
+         - SPOKES: 8 silk strands radiating outward
+         - RINGS: 3 concentric ellipses crossing spokes
+         - EACH SPOKE has 12 nodes (Verlet chain)
+         - IDLE: gentle breathing oscillation
+         - MOVE: elastic stretch & wobble
+         ═══════════════════════════════════════════════════ */
+
+      const SPOKE_COUNT  = 8;
+      const SPOKE_NODES  = 10;
+      const RING_COUNT   = 3;
+      const BASE_RADIUS  = [14, 26, 40];  // ring radii (idle)
+      const MAX_SPOKE_R  = 46;            // spoke tip radius (idle)
+
+      // Spoke tip positions (Verlet nodes)
+      const tipX = new Float64Array(SPOKE_COUNT);
+      const tipY = new Float64Array(SPOKE_COUNT);
+      const tipPX = new Float64Array(SPOKE_COUNT);
+      const tipPY = new Float64Array(SPOKE_COUNT);
+
+      // Intermediate spoke nodes for curve rendering
+      const midX = new Float64Array(SPOKE_COUNT * 3); // 3 mid-nodes per spoke
+      const midY = new Float64Array(SPOKE_COUNT * 3);
+      const midPX = new Float64Array(SPOKE_COUNT * 3);
+      const midPY = new Float64Array(SPOKE_COUNT * 3);
+
+      // Each spoke's rest angle
+      const spokeAngle = new Float64Array(SPOKE_COUNT);
+      for(let i=0;i<SPOKE_COUNT;i++){
+        spokeAngle[i] = (i/SPOKE_COUNT)*TAU;
+        const r = MAX_SPOKE_R;
+        const a = spokeAngle[i];
+        tipX[i]  = P.x + Math.cos(a)*r;
+        tipY[i]  = P.y + Math.sin(a)*r;
+        tipPX[i] = tipX[i]; tipPY[i] = tipY[i];
+        for(let m=0;m<3;m++){
+          const mr = r*(m+1)/4;
+          const mi = i*3+m;
+          midX[mi] = P.x + Math.cos(a)*mr; midY[mi] = P.y + Math.sin(a)*mr;
+          midPX[mi] = midX[mi]; midPY[mi] = midY[mi];
+        }
+      }
+
+      // Web breathe phase
+      let breathePhase = 0;
+      // Cursor wobble
+      let wobX = 0, wobY = 0, wobVX = 0, wobVY = 0;
+
+      function updateWebPhysics(dtS, now){
+        breathePhase += dtS * 1.4;
+        const breathe = Math.sin(breathePhase) * 0.055;
+        const speedFactor = clamp(P.speed/250,0,1);
+
+        // Wobble spring — reacts to cursor velocity
+        const WOBK = 48, WOBD = 8;
+        wobVX += (-wobX*WOBK - wobVX*WOBD)*dtS;
+        wobVY += (-wobY*WOBK - wobVY*WOBD)*dtS;
+        wobVX += P.vx * 0.015;
+        wobVY += P.vy * 0.015;
+        wobX += wobVX*dtS; wobY += wobVY*dtS;
+
+        const cx = P.x + wobX;
+        const cy = P.y + wobY;
+
+        // Update spoke tips (elastic Verlet)
+        const TIP_DAMP = 0.84 + speedFactor*0.09;
+        for(let i=0;i<SPOKE_COUNT;i++){
+          const a    = spokeAngle[i];
+          // Each spoke gets a unique idle sway
+          const idleSway = Math.sin(breathePhase + i*0.8)*2.5;
+          const targetR  = MAX_SPOKE_R * (1 + breathe + idleSway*0.04);
+          const tx = cx + Math.cos(a)*targetR + Math.sin(a)*idleSway*0.5;
+          const ty = cy + Math.sin(a)*targetR - Math.cos(a)*idleSway*0.5;
+
+          // Verlet
+          const vx = (tipX[i]-tipPX[i])*TIP_DAMP;
+          const vy = (tipY[i]-tipPY[i])*TIP_DAMP;
+          tipPX[i]=tipX[i]; tipPY[i]=tipY[i];
+          tipX[i]+=vx; tipY[i]+=vy;
+          // Spring to target
+          const ex=tx-tipX[i], ey=ty-tipY[i];
+          tipX[i]+=ex*(22+speedFactor*8)*dtS;
+          tipY[i]+=ey*(22+speedFactor*8)*dtS;
+
+          // Intermediate nodes
+          for(let m=0;m<3;m++){
+            const mi   = i*3+m;
+            const frac = (m+1)/4;
+            // Organic sway per mid-node
+            const ms   = Math.sin(breathePhase*1.1 + i*0.7 + m*0.4)*1.8;
+            const mtx  = lerp(cx, tipX[i], frac) + Math.sin(a+Math.PI*0.5)*ms;
+            const mty  = lerp(cy, tipY[i], frac) + Math.cos(a+Math.PI*0.5)*ms;
+            const mvx  = (midX[mi]-midPX[mi])*0.86;
+            const mvy  = (midY[mi]-midPY[mi])*0.86;
+            midPX[mi]=midX[mi]; midPY[mi]=midY[mi];
+            midX[mi]+=mvx; midY[mi]+=mvy;
+            midX[mi]+=(mtx-midX[mi])*28*dtS;
+            midY[mi]+=(mty-midY[mi])*28*dtS;
+          }
+        }
+      }
+
+      /* ═══════════════════════════════════════════════════
+         DRAW WEB CURSOR
+         ═══════════════════════════════════════════════════ */
+      function drawWebCursor(now){
+        const cx = P.x + wobX, cy = P.y + wobY;
+        const speedFactor = clamp(P.speed/250,0,1);
+        const breathe     = Math.sin(breathePhase);
+        const stretchGlow = 0.18 + speedFactor*0.28 + breathe*0.04;
+
+        ctx.save();
+
+        /* ── Far outer glow halo ── */
+        ctx.globalCompositeOperation = "lighter";
+        const haloG = ctx.createRadialGradient(cx,cy,0,cx,cy,MAX_SPOKE_R*1.6);
+        haloG.addColorStop(0,`rgba(200,210,255,${0.06+speedFactor*0.06})`);
+        haloG.addColorStop(0.5,`rgba(160,180,255,${0.03})`);
+        haloG.addColorStop(1,"rgba(0,0,0,0)");
+        ctx.fillStyle=haloG; ctx.beginPath(); ctx.arc(cx,cy,MAX_SPOKE_R*1.6,0,TAU); ctx.fill();
+
+        ctx.globalCompositeOperation = "source-over";
+
+        /* ── SPOKES ── drawn as smooth bezier curves with silk texture ── */
+        for(let i=0;i<SPOKE_COUNT;i++){
+          const mi0 = i*3+0, mi1 = i*3+1, mi2 = i*3+2;
+          const stretch = hypot(tipX[i]-cx-(tipX[i]-cx)*0,tipY[i]-cy)/MAX_SPOKE_R;
+          const alpha = clamp(0.55 + breathe*0.08 + speedFactor*0.1, 0.3, 0.9);
+
+          // Outer silk glow
+          ctx.beginPath();
+          ctx.moveTo(cx,cy);
+          ctx.bezierCurveTo(
+            midX[mi0],midY[mi0],
+            midX[mi2],midY[mi2],
+            tipX[i],tipY[i]
+          );
+          ctx.lineWidth=2.8 + speedFactor*0.8;
+          ctx.strokeStyle=`rgba(200,215,255,${alpha*0.22})`;
+          ctx.lineCap="round"; ctx.stroke();
+
+          // Core silk strand
+          ctx.beginPath();
+          ctx.moveTo(cx,cy);
+          ctx.bezierCurveTo(
+            midX[mi0],midY[mi0],
+            midX[mi2],midY[mi2],
+            tipX[i],tipY[i]
+          );
+          ctx.lineWidth=0.85;
+          ctx.strokeStyle=`rgba(235,240,255,${alpha*0.88})`;
+          ctx.stroke();
+
+          // Ultra-thin highlight filament
+          const dx0 = midX[mi0]-cx, dy0 = midY[mi0]-cy;
+          const perp0X = -dy0/(hypot(dx0,dy0)||1)*0.9;
+          const perp0Y =  dx0/(hypot(dx0,dy0)||1)*0.9;
+          ctx.beginPath();
+          ctx.moveTo(cx+perp0X,cy+perp0Y);
+          ctx.bezierCurveTo(
+            midX[mi0]+perp0X, midY[mi0]+perp0Y,
+            midX[mi2]+perp0X, midY[mi2]+perp0Y,
+            tipX[i]+perp0X,    tipY[i]+perp0Y
+          );
+          ctx.lineWidth=0.35;
+          ctx.strokeStyle=`rgba(255,255,255,${alpha*0.45})`;
+          ctx.stroke();
+        }
+
+        /* ── RING SILK THREADS ── ── ── ── ── ── ── ── ──
+            For each ring radius, draw segments connecting adjacent spoke
+            intersection points (interpolated along bezier spokes).
+        ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── */
+        for(let ring=0;ring<RING_COUNT;ring++){
+          const frac   = BASE_RADIUS[ring]/MAX_SPOKE_R;
+          const ringPts = [];
+
+          for(let i=0;i<SPOKE_COUNT;i++){
+            const mi0=i*3+0, mi1=i*3+1, mi2=i*3+2;
+            // Sample point along the spoke bezier at parameter t=frac
+            const t=frac;
+            const mt=1-t;
+            // Cubic bezier with 4 control points: cx,cy → mid0 → mid2 → tip
+            const bx = mt*mt*mt*cx + 3*mt*mt*t*midX[mi0] + 3*mt*t*t*midX[mi2] + t*t*t*tipX[i];
+            const by = mt*mt*mt*cy + 3*mt*mt*t*midY[mi0] + 3*mt*t*t*midY[mi2] + t*t*t*tipY[i];
+            ringPts.push({x:bx, y:by});
+          }
+
+          // Ring alpha — inner rings brighter
+          const ringAlpha = clamp(0.55 - ring*0.10 + breathe*0.06, 0.2, 0.75);
+          const ringW     = 0.7 - ring*0.08;
+
+          // Draw segments between adjacent ring points
+          for(let i=0;i<SPOKE_COUNT;i++){
+            const a = ringPts[i];
+            const b = ringPts[(i+1)%SPOKE_COUNT];
+            // Sag toward center for organic look
+            const sagT = 0.08 + ring*0.04;
+            const cpx  = lerp(a.x,b.x,0.5) + (cx - lerp(a.x,b.x,0.5))*sagT;
+            const cpy  = lerp(a.y,b.y,0.5) + (cy - lerp(a.y,b.y,0.5))*sagT;
+
+            // Glow
+            ctx.beginPath();
+            ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(cpx,cpy,b.x,b.y);
+            ctx.lineWidth=ringW*2.5+speedFactor*0.5;
+            ctx.strokeStyle=`rgba(190,210,255,${ringAlpha*0.2})`;
+            ctx.lineCap="round"; ctx.stroke();
+            // Core silk
+            ctx.beginPath();
+            ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(cpx,cpy,b.x,b.y);
+            ctx.lineWidth=ringW;
+            ctx.strokeStyle=`rgba(230,238,255,${ringAlpha*0.85})`;
+            ctx.stroke();
+            // Highlight
+            ctx.beginPath();
+            ctx.moveTo(a.x,a.y); ctx.quadraticCurveTo(
+              lerp(cpx,cx,0.05), lerp(cpy,cy,0.05), b.x,b.y
+            );
+            ctx.lineWidth=Math.max(0.2, ringW*0.35);
+            ctx.strokeStyle=`rgba(255,255,255,${ringAlpha*0.42})`;
+            ctx.stroke();
+          }
+        }
+
+        /* ── NODE INTERSECTIONS ── tiny glinting silk knots ── */
+        for(let ring=0;ring<RING_COUNT;ring++){
+          const frac = BASE_RADIUS[ring]/MAX_SPOKE_R;
+          for(let i=0;i<SPOKE_COUNT;i++){
+            const mi0=i*3+0, mi2=i*3+2;
+            const t=frac, mt=1-t;
+            const bx=mt*mt*mt*cx+3*mt*mt*t*midX[mi0]+3*mt*t*t*midX[mi2]+t*t*t*tipX[i];
+            const by=mt*mt*mt*cy+3*mt*mt*t*midY[mi0]+3*mt*t*t*midY[mi2]+t*t*t*tipY[i];
+            const glit = 0.4+0.35*Math.sin(breathePhase*1.6+i*0.9+ring*2.1);
+            ctx.globalCompositeOperation="lighter";
+            const ng=ctx.createRadialGradient(bx,by,0,bx,by,2.5);
+            ng.addColorStop(0,`rgba(240,248,255,${glit*0.75})`);
+            ng.addColorStop(0.5,`rgba(170,200,255,${glit*0.28})`);
+            ng.addColorStop(1,"rgba(0,0,0,0)");
+            ctx.fillStyle=ng; ctx.beginPath(); ctx.arc(bx,by,2.5,0,TAU); ctx.fill();
+            ctx.globalCompositeOperation="source-over";
+          }
+        }
+
+        /* ── CENTER ANCHOR ── */
+        ctx.globalCompositeOperation="lighter";
+        const cag=ctx.createRadialGradient(cx,cy,0,cx,cy,8);
+        cag.addColorStop(0,`rgba(255,255,255,${0.70+breathe*0.12})`);
+        cag.addColorStop(0.4,`rgba(200,220,255,${0.42+breathe*0.06})`);
+        cag.addColorStop(0.8,`rgba(120,160,255,0.12)`);
+        cag.addColorStop(1,"rgba(0,0,0,0)");
+        ctx.fillStyle=cag; ctx.beginPath(); ctx.arc(cx,cy,8,0,TAU); ctx.fill();
+        ctx.globalCompositeOperation="source-over";
+        ctx.fillStyle=`rgba(255,255,255,${0.85+breathe*0.10})`;
+        ctx.beginPath(); ctx.arc(cx,cy,2.4,0,TAU); ctx.fill();
+
+        /* ── TIP GLINTS ── */
+        ctx.globalCompositeOperation="lighter";
+        for(let i=0;i<SPOKE_COUNT;i++){
+          const g2=Math.sin(breathePhase*1.3+i*1.1)*0.5+0.5;
+          const tg=ctx.createRadialGradient(tipX[i],tipY[i],0,tipX[i],tipY[i],3.5);
+          tg.addColorStop(0,`rgba(230,242,255,${g2*0.65})`);
+          tg.addColorStop(1,"rgba(0,0,0,0)");
+          ctx.fillStyle=tg; ctx.beginPath(); ctx.arc(tipX[i],tipY[i],3.5,0,TAU); ctx.fill();
+        }
+        ctx.globalCompositeOperation="source-over";
+
+        ctx.restore();
+      }
+
+      /* ═══════════════════════════════════════════════════
+         ATMOSPHERE — soft red/blue field distortion that
+         trails the cursor while it moves. Cheap (two radial
+         gradients), always secondary to the web itself.
+         ═══════════════════════════════════════════════════ */
+      function drawAtmosphere(cx, cy, speedFactor){
+        if(speedFactor < 0.04) return;
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        const ang = Math.atan2(P.vy, P.vx) || 0;
+        const off = 5 + speedFactor*11;
+        const rad = 22 + speedFactor*26;
+        const rx = cx + Math.cos(ang)*off, ry = cy + Math.sin(ang)*off;
+        const bx = cx - Math.cos(ang)*off, by = cy - Math.sin(ang)*off;
+
+        const rG = ctx.createRadialGradient(rx,ry,0,rx,ry,rad);
+        rG.addColorStop(0, `rgba(255,90,70,${0.045+speedFactor*0.05})`);
+        rG.addColorStop(0.6, `rgba(220,50,50,${0.02+speedFactor*0.02})`);
+        rG.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = rG; ctx.beginPath(); ctx.arc(rx,ry,rad,0,TAU); ctx.fill();
+
+        const bG = ctx.createRadialGradient(bx,by,0,bx,by,rad);
+        bG.addColorStop(0, `rgba(80,120,255,${0.045+speedFactor*0.05})`);
+        bG.addColorStop(0.6, `rgba(50,80,220,${0.02+speedFactor*0.02})`);
+        bG.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = bG; ctx.beginPath(); ctx.arc(bx,by,rad,0,TAU); ctx.fill();
+
+        ctx.restore();
+      }
+
+      /* ═══════════════════════════════════════════════════
+         ENERGY EFFECTS — red & blue gaseous energy
+         (pooled, fixed-size — no per-frame allocation)
+         ═══════════════════════════════════════════════════ */
+      const EMAX=320; const energy=new Array(EMAX); for(let i=0;i<EMAX;i++) energy[i]={alive:false}; let eHead=0;
+      function spawnEnergy(x,y,vx,vy,life,sz,isRed){
+        const e=energy[eHead%EMAX]; eHead++;
+        e.alive=true; e.x=x; e.y=y; e.vx=vx; e.vy=vy;
+        e.age=0; e.life=life; e.sz=sz; e.isRed=isRed;
+        e.phase=rand(0,TAU); e.sway=rand(0.3,0.9); e.grav=rand(-6,2);
+      }
+
+      /* ── Tiny glowing sparks — richer, cheaper twinkle layer ── */
+      const SPARKMAX=160; const sparks=new Array(SPARKMAX); for(let i=0;i<SPARKMAX;i++) sparks[i]={alive:false}; let sparkHead=0;
+      function spawnSpark(x,y,isRed){
+        const s=sparks[sparkHead%SPARKMAX]; sparkHead++;
+        s.alive=true; s.x=x+rand(-9,9); s.y=y+rand(-9,9);
+        s.vx=rand(-28,28); s.vy=rand(-42,6);
+        s.age=0; s.life=rand(180,420); s.sz=rand(0.6,1.5); s.isRed=isRed;
+        s.tw=rand(0,TAU);
+      }
+
+      /* ── Silk fragments — tiny web fiber particles ── */
+      const FMAX=260; const fibers=new Array(FMAX); for(let i=0;i<FMAX;i++) fibers[i]={alive:false}; let fibHead=0;
+      function spawnFiber(x,y,vx,vy,life,len){
+        const f=fibers[fibHead%FMAX]; fibHead++;
+        f.alive=true; f.x=x; f.y=y; f.vx=vx; f.vy=vy;
+        f.age=0; f.life=life; f.len=len;
+        f.angle=rand(0,TAU); f.spin=rand(-4,4); f.grav=rand(10,40);
+      }
+
+      /* ── Web shot splats — pooled (was push/splice) ── */
+      const WSMAX=8; const WEBSHOTS=new Array(WSMAX); for(let i=0;i<WSMAX;i++) WEBSHOTS[i]={alive:false}; let wsHead=0;
+      function spawnWebSplat(x,y,maxR,strands,rings,life){
+        const w=WEBSHOTS[wsHead%WSMAX]; wsHead++;
+        w.alive=true; w.x=x; w.y=y; w.age=0; w.life=life;
+        w.maxR=maxR; w.strands=strands; w.rings=rings;
+      }
+
+      /* ── Shockwave & flash — pooled ── */
+      const FLASHMAX=20; const flashes=new Array(FLASHMAX); for(let i=0;i<FLASHMAX;i++) flashes[i]={alive:false}; let flashHead=0;
+      function spawnFlash(x,y,maxR,life){
+        const f=flashes[flashHead%FLASHMAX]; flashHead++;
+        f.alive=true; f.x=x; f.y=y; f.maxR=maxR; f.age=0; f.life=life;
+      }
+      const WAVEMAX=20; const waves=new Array(WAVEMAX); for(let i=0;i<WAVEMAX;i++) waves[i]={alive:false}; let waveHead=0;
+      function spawnWave(x,y,maxR,life){
+        const w=waves[waveHead%WAVEMAX]; waveHead++;
+        w.alive=true; w.x=x; w.y=y; w.maxR=maxR; w.age=0; w.life=life;
+      }
+
+      /* ── Dissolving silk threads (after burst) ── */
+      const DMAX=72; const dissolve=new Array(DMAX); for(let i=0;i<DMAX;i++) dissolve[i]={alive:false}; let disHead=0;
+      function spawnDissolve(x,y,angle,len,life){
+        const d=dissolve[disHead%DMAX]; disHead++;
+        d.alive=true; d.x=x; d.y=y; d.angle=angle; d.len=len;
+        d.age=0; d.life=life; d.width=rand(0.6,1.8);
+        d.sag=rand(-8,8);
+      }
+
+      /* ── Trail ── */
+      const TMAX=52; const trail=[];
+      function addTrail(x,y,t){ if(trail.length>=TMAX) trail.shift(); trail.push({x,y,t}); }
+
+      /* ── HD glow ── */
+      const HDMAX=80; const hdCells=new Array(HDMAX); for(let i=0;i<HDMAX;i++) hdCells[i]={alive:false}; let hdHead=0;
+      function spawnHD(x,y,str,life){
+        const h=hdCells[hdHead%HDMAX]; hdHead++;
+        h.alive=true; h.x=x; h.y=y; h.str=str; h.age=0; h.life=life;
+      }
+
+      /* ═══════════════════════════════════════════════════
+         WEB SHOT PROJECTILE — a real shot line that stretches
+         out from the cursor at speed, weaves a forming web
+         mesh while travelling, throws off branching filaments
+         and dissolving fibers, then blossoms into a full silk
+         splat on impact (which briefly sticks, then fades).
+         ═══════════════════════════════════════════════════ */
+      const SHOOTMAX=10; const shootLines=new Array(SHOOTMAX); for(let i=0;i<SHOOTMAX;i++) shootLines[i]={alive:false}; let shootHead=0;
+      let shotToggle=1;
+
+      function computeShotAngle(){
+        if(P.speed > 55) return Math.atan2(P.vy,P.vx);
+        shotToggle *= -1;
+        return -Math.PI/2 + rand(0.32,0.8)*shotToggle;
+      }
+
+      function spawnShootLine(x0,y0,angle,dist,life){
+        const s=shootLines[shootHead%SHOOTMAX]; shootHead++;
+        s.alive=true; s.impacted=false;
+        s.x0=x0; s.y0=y0; s.angle=angle; s.dist=dist;
+        s.age=0; s.life=life; s.branchSeed=rand(0,1000);
+        s.nextFiber=0;
+        return s;
+      }
+
+      function spawnWebImpact(x,y){
+        spawnWebSplat(x,y, rand(96,142), randi(7,10), randi(2,4), rand(820,1050));
+        spawnFlash(x,y, rand(130,210), rand(380,460));
+        spawnWave(x,y, rand(92,152), rand(460,560));
+
+        const STRANDS=16;
+        for(let i=0;i<STRANDS;i++){
+          const a=rand(0,TAU), d=rand(20,96);
+          spawnDissolve(x,y,a,d,rand(420,780));
+        }
+        for(let i=0;i<52;i++){
+          const a=rand(0,TAU), spd=rand(40,260);
+          spawnFiber(x,y,Math.cos(a)*spd,Math.sin(a)*spd,rand(320,820),rand(8,30));
+        }
+        for(let i=0;i<26;i++){
+          const a=rand(0,TAU), spd=rand(20,150);
+          spawnEnergy(x,y,Math.cos(a)*spd,Math.sin(a)*spd,rand(260,560),rand(1.5,4.5),Math.random()<0.5);
+        }
+        for(let i=0;i<14;i++) spawnSpark(x,y,Math.random()<0.5);
+        spawnHD(x,y,rand(9,15),rand(420,720));
+      }
+
+      function updateAndDrawShootLines(dt, now){
+        ctx.save();
+        for(let i=0;i<SHOOTMAX;i++){
+          const s=shootLines[i];
+          if(!s.alive) continue;
+          s.age += dt;
+          const tp = clamp(s.age/s.life,0,1);
+          const eased = 1-Math.pow(1-tp,3);
+          const curDist = s.dist*eased;
+          const tipX2 = s.x0 + Math.cos(s.angle)*curDist;
+          const tipY2 = s.y0 + Math.sin(s.angle)*curDist;
+          const perpA = s.angle+Math.PI*0.5;
+          const meshW = lerp(0.5,5.2,tp);
+
+          const fadeIn = clamp(tp*6,0,1);
+
+          ctx.beginPath();
+          ctx.moveTo(s.x0,s.y0);
+          ctx.lineTo(tipX2,tipY2);
+          ctx.lineWidth=3.2*fadeIn;
+          ctx.strokeStyle=`rgba(200,220,255,${0.18*fadeIn})`;
+          ctx.lineCap="round"; ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(s.x0,s.y0);
+          ctx.lineTo(tipX2,tipY2);
+          ctx.lineWidth=0.9;
+          ctx.strokeStyle=`rgba(240,248,255,${0.92*fadeIn})`;
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.moveTo(s.x0+Math.cos(perpA)*meshW, s.y0+Math.sin(perpA)*meshW);
+          ctx.lineTo(tipX2,tipY2);
+          ctx.lineWidth=0.5;
+          ctx.strokeStyle=`rgba(220,235,255,${0.5*fadeIn})`;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(s.x0-Math.cos(perpA)*meshW, s.y0-Math.sin(perpA)*meshW);
+          ctx.lineTo(tipX2,tipY2);
+          ctx.lineWidth=0.5;
+          ctx.strokeStyle=`rgba(220,235,255,${0.5*fadeIn})`;
+          ctx.stroke();
+
+          const branches=4;
+          for(let b=1;b<=branches;b++){
+            const frac=b/(branches+1);
+            if(frac>tp) break;
+            const bx=lerp(s.x0,tipX2,frac);
+            const by=lerp(s.y0,tipY2,frac);
+            const seed=Math.sin(s.branchSeed+b*12.9);
+            const spread=0.35+Math.abs(seed)*0.4;
+            const blen=(6+Math.abs(seed)*10)*(1-frac*0.4);
+            const bAlpha=(1-frac)*0.5*fadeIn;
+            for(const dir of [1,-1]){
+              ctx.beginPath();
+              ctx.moveTo(bx,by);
+              ctx.lineTo(bx+Math.cos(s.angle+spread*dir)*blen, by+Math.sin(s.angle+spread*dir)*blen);
+              ctx.lineWidth=0.4;
+              ctx.strokeStyle=`rgba(225,240,255,${bAlpha})`;
+              ctx.stroke();
+            }
+          }
+
+          if(s.age - s.nextFiber > 14 && tp < 0.97){
+            s.nextFiber = s.age;
+            const a=rand(0,TAU), spd=rand(6,40);
+            spawnFiber(tipX2,tipY2,Math.cos(a)*spd,Math.sin(a)*spd,rand(260,520),rand(5,14));
+          }
+
+          if(tp>=1 && !s.impacted){
+            s.impacted=true;
+            s.alive=false;
+            spawnWebImpact(tipX2,tipY2);
+          }
+        }
+        ctx.restore();
+      }
+
+      function webShot(x,y){
+        for(let i=0;i<SPOKE_COUNT;i++){
+          const a = spokeAngle[i];
+          tipX[i] = P.x + Math.cos(a)*6;
+          tipY[i] = P.y + Math.sin(a)*6;
+        }
+
+        const angle = computeShotAngle();
+        const dist  = rand(150,235);
+        const life  = rand(85,130);
+        spawnShootLine(x,y,angle,dist,life);
+
+        for(let i=0;i<26;i++){
+          const a=rand(0,TAU), spd=rand(30,200);
+          spawnEnergy(x,y,Math.cos(a)*spd,Math.sin(a)*spd,rand(280,650),rand(2,6),Math.random()<0.5);
+        }
+        for(let i=0;i<10;i++) spawnSpark(x,y,Math.random()<0.5);
+        for(let i=0;i<14;i++){
+          const a=rand(0,TAU), spd=rand(20,90);
+          spawnFiber(x,y,Math.cos(a)*spd,Math.sin(a)*spd,rand(220,420),rand(6,16));
+        }
+
+        spawnHD(x,y,rand(8,14),rand(320,520));
+      }
+
+      function drawWebShot(ws){
+        const tp = ws.age/ws.life;
+
+        const expandT = clamp(tp/0.22,0,1);
+        const ease  = 1-Math.pow(1-expandT,0.5);
+        const R     = ws.maxR*ease;
+
+        const stick = 0.34;
+        let alpha;
+        if(tp < stick){
+          alpha = lerp(0.2,0.85, clamp(tp/0.12,0,1));
+        } else {
+          const ft=(tp-stick)/(1-stick);
+          alpha = 0.85*Math.pow(1-ft,1.7);
+        }
+        if(alpha<0.01) return;
+
+        ctx.save();
+        ctx.translate(ws.x, ws.y);
+
+        ctx.globalCompositeOperation="lighter";
+        const gd=ctx.createRadialGradient(0,0,0,0,0,R*0.95);
+        gd.addColorStop(0,`rgba(220,235,255,${alpha*0.12})`);
+        gd.addColorStop(0.7,`rgba(180,210,255,${alpha*0.06})`);
+        gd.addColorStop(1,"rgba(0,0,0,0)");
+        ctx.fillStyle=gd; ctx.beginPath(); ctx.arc(0,0,R*0.95,0,TAU); ctx.fill();
+        ctx.globalCompositeOperation="source-over";
+
+        for(let s=0;s<ws.strands;s++){
+          const a    = (s/ws.strands)*TAU + tp*0.25;
+          const slen = R*(0.85+0.15*Math.sin(tp*8+s));
+          const midR = slen*0.45;
+
+          const perp = Math.sin(tp*6+s*1.4)*R*0.08;
+          const mx   = Math.cos(a+Math.PI*0.5)*perp + Math.cos(a)*midR;
+          const my   = Math.sin(a+Math.PI*0.5)*perp + Math.sin(a)*midR;
+
+          ctx.beginPath();
+          ctx.moveTo(0,0);
+          ctx.quadraticCurveTo(mx,my,Math.cos(a)*slen,Math.sin(a)*slen);
+          ctx.lineWidth=2.2+alpha*1.2;
+          ctx.strokeStyle=`rgba(200,220,255,${alpha*0.22})`;
+          ctx.lineCap="round"; ctx.stroke();
+          
+          ctx.beginPath();
+          ctx.moveTo(0,0);
+          ctx.quadraticCurveTo(mx,my,Math.cos(a)*slen,Math.sin(a)*slen);
+          ctx.lineWidth=0.8;
+          ctx.strokeStyle=`rgba(240,248,255,${alpha*0.90})`;
+          ctx.stroke();
+
+          if(Math.random()<0.7){
+            const bx=Math.cos(a)*midR*1.1+Math.cos(a+Math.PI*0.5)*perp;
+            const by=Math.sin(a)*midR*1.1+Math.sin(a+Math.PI*0.5)*perp;
+            const bLen=(R-midR)*0.55;
+            const ba1=a+rand(0.3,0.7);
+            const ba2=a-rand(0.3,0.7);
+            for(const ba of [ba1,ba2]){
+              ctx.beginPath();
+              ctx.moveTo(bx,by);
+              ctx.lineTo(bx+Math.cos(ba)*bLen, by+Math.sin(ba)*bLen);
+              ctx.lineWidth=0.5;
+              ctx.strokeStyle=`rgba(225,240,255,${alpha*0.62})`;
+              ctx.stroke();
+            }
+          }
+        }
+
+        for(let r=0;r<ws.rings;r++){
+          const ringR = R*(r+1)/(ws.rings+0.5);
+          for(let s=0;s<ws.strands;s++){
+            const a0 = (s/ws.strands)*TAU + tp*0.25;
+            const a1 = ((s+1)/ws.strands)*TAU + tp*0.25;
+            const sag = Math.cos((a0+a1)*0.5)*ringR*0.04;
+            const cpx = Math.cos((a0+a1)*0.5)*ringR*(0.94-sag*0.01);
+            const cpy = Math.sin((a0+a1)*0.5)*ringR*(0.94-sag*0.01);
+
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(a0)*ringR, Math.sin(a0)*ringR);
+            ctx.quadraticCurveTo(cpx,cpy, Math.cos(a1)*ringR, Math.sin(a1)*ringR);
+            ctx.lineWidth=0.65;
+            ctx.strokeStyle=`rgba(225,240,255,${alpha*(0.85-r*0.18)})`;
+            ctx.lineCap="round"; ctx.stroke();
+          }
+        }
+
+        ctx.globalCompositeOperation="lighter";
+        const cg=ctx.createRadialGradient(0,0,0,0,0,6);
+        cg.addColorStop(0,`rgba(255,255,255,${alpha*0.9})`);
+        cg.addColorStop(1,"rgba(0,0,0,0)");
+        ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(0,0,6,0,TAU); ctx.fill();
+        ctx.globalCompositeOperation="source-over";
+
+        ctx.restore();
+      }
+
+      /* ═══════════════════════════════════════════════════
+         MAIN LOOP
+         ═══════════════════════════════════════════════════ */
+      let last=performance.now();
+      let ambE=0, ambF=0, ambHD=0, ambSpark=0;
+
+      function frame(now){
+        requestAnimationFrame(frame);
+        const dt  = Math.min(now-last,33); last=now;
+        const dtS = dt*0.001;
+
+        P.px=P.x; P.py=P.y;
+        const ease=1-Math.pow(0.005,dtS*5);
+        P.x=lerp(P.x,P.tx,ease); P.y=lerp(P.y,P.ty,ease);
+        P.vx=(P.x-P.px)/Math.max(dtS,0.001); P.vy=(P.y-P.py)/Math.max(dtS,0.001);
+        P.speed=hypot(P.vx,P.vy);
+        P.moving=(now-P.lastMove)<140;
+
+        const bx=(P.tx/W-0.5)*-26, by=(P.ty/H-0.5)*-26;
+        tbg.style.transform=`translate(${bx|0}px,${by|0}px) scale(1.08)`;
+
+        updateWebPhysics(dtS,now);
+
+        addTrail(P.x,P.y,now);
+        while(trail.length&&now-trail[0].t>280) trail.shift();
+
+        const speedFactor=clamp(P.speed/250,0,1);
+
+        // Ambient particle spawns
+        if(speedFactor > 0.05){
+          ambE += dtS * speedFactor * 45;
+          while(ambE >= 1){
+            ambE--;
+            const a = rand(0, TAU), spd = rand(10, 50);
+            spawnEnergy(P.x, P.y, Math.cos(a)*spd, Math.sin(a)*spd, rand(200,450), rand(1,3), Math.random()<0.5);
+          }
+          ambF += dtS * speedFactor * 30;
+          while(ambF >= 1){
+            ambF--;
+            const a = rand(0, TAU), spd = rand(15, 60);
+            spawnFiber(P.x, P.y, Math.cos(a)*spd, Math.sin(a)*spd, rand(200,400), rand(4,12));
+          }
+        }
+
+        // Clear canvases
+        ctx.clearRect(0,0,W,H);
+        hctx.clearRect(0,0,W,H);
+
+        // 1. Atmosphere
+        drawAtmosphere(P.x + wobX, P.y + wobY, speedFactor);
+
+        // 2. Web Shot Projectiles & Splats
+        updateAndDrawShootLines(dt, now);
+        for(let i=0;i<WSMAX;i++){
+          const ws=WEBSHOTS[i];
+          if(!ws.alive) continue;
+          ws.age += dt;
+          if(ws.age >= ws.life){ ws.alive=false; continue; }
+          drawWebShot(ws);
+        }
+
+        // 3. Shockwaves & Flashes
+        for(let i=0;i<WAVEMAX;i++){
+          const w=waves[i]; if(!w.alive) continue;
+          w.age += dt; const tp=w.age/w.life;
+          if(tp>=1){ w.alive=false; continue; }
+          const r=w.maxR*(1-Math.pow(1-tp,2));
+          ctx.save();
+          ctx.beginPath(); ctx.arc(w.x,w.y,r,0,TAU);
+          ctx.lineWidth=2.5*(1-tp);
+          ctx.strokeStyle=`rgba(200,220,255,${0.4*(1-tp)})`;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        for(let i=0;i<FLASHMAX;i++){
+          const f=flashes[i]; if(!f.alive) continue;
+          f.age += dt; const tp=f.age/f.life;
+          if(tp>=1){ f.alive=false; continue; }
+          ctx.save();
+          ctx.globalCompositeOperation="lighter";
+          const g=ctx.createRadialGradient(f.x,f.y,0,f.x,f.y,f.maxR*(1-tp));
+          g.addColorStop(0,`rgba(255,255,255,${0.8*(1-tp)})`);
+          g.addColorStop(0.5,`rgba(150,190,255,${0.3*(1-tp)})`);
+          g.addColorStop(1,"rgba(0,0,0,0)");
+          ctx.fillStyle=g; ctx.beginPath(); ctx.arc(f.x,f.y,f.maxR*(1-tp),0,TAU); ctx.fill();
+          ctx.restore();
+        }
+
+        // 4. Dissolving Silk Threads
+        for(let i=0;i<DMAX;i++){
+          const d=dissolve[i]; if(!d.alive) continue;
+          d.age += dt; const tp=d.age/d.life;
+          if(tp>=1){ d.alive=false; continue; }
+          const alpha=(1-tp)*0.7;
+          const x1=d.x, y1=d.y;
+          const x2=d.x+Math.cos(d.angle)*d.len;
+          const y2=d.y+Math.sin(d.angle)*d.len;
+          const cpx=lerp(x1,x2,0.5)+Math.sin(d.angle)*d.sag;
+          const cpy=lerp(y1,y2,0.5)-Math.cos(d.angle)*d.sag;
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(x1,y1); ctx.quadraticCurveTo(cpx,cpy,x2,y2);
+          ctx.lineWidth=d.width*(1-tp);
+          ctx.strokeStyle=`rgba(230,240,255,${alpha})`;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // 5. Energy Gaseous Particles
+        for(let i=0;i<EMAX;i++){
+          const e=energy[i]; if(!e.alive) continue;
+          e.age += dt; if(e.age >= e.life){ e.alive=false; continue; }
+          const tp=e.age/e.life;
+          e.x += e.vx*dtS; e.y += e.vy*dtS + e.grav*dtS;
+          e.vx *= 0.96; e.vy *= 0.96;
+          const alpha = (1-tp)*0.35;
+          ctx.save();
+          ctx.globalCompositeOperation="lighter";
+          ctx.fillStyle=e.isRed ? `rgba(255,60,60,${alpha})` : `rgba(80,130,255,${alpha})`;
+          ctx.beginPath(); ctx.arc(e.x, e.y, e.sz*(1-tp*0.5), 0, TAU); ctx.fill();
+          ctx.restore();
+        }
+
+        // 6. Silk Fibers
+        for(let i=0;i<FMAX;i++){
+          const f=fibers[i]; if(!f.alive) continue;
+          f.age += dt; if(f.age >= f.life){ f.alive=false; continue; }
+          const tp=f.age/f.life;
+          f.x += f.vx*dtS; f.y += f.vy*dtS + f.grav*dtS;
+          f.angle += f.spin*dtS;
+          const alpha=(1-tp)*0.6;
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(f.x, f.y);
+          ctx.lineTo(f.x+Math.cos(f.angle)*f.len, f.y+Math.sin(f.angle)*f.len);
+          ctx.lineWidth=0.6;
+          ctx.strokeStyle=`rgba(240,248,255,${alpha})`;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // 7. Sparks
+        for(let i=0;i<SPARKMAX;i++){
+          const s=sparks[i]; if(!s.alive) continue;
+          s.age += dt; if(s.age >= s.life){ s.alive=false; continue; }
+          const tp=s.age/s.life;
+          s.x += s.vx*dtS; s.y += s.vy*dtS;
+          s.vx *= 0.95; s.vy *= 0.95;
+          const tw=Math.sin(s.tw+now*0.02)*0.5+0.5;
+          ctx.save();
+          ctx.globalCompositeOperation="lighter";
+          ctx.fillStyle=s.isRed ? `rgba(255,120,100,${tw*(1-tp)})` : `rgba(150,190,255,${tw*(1-tp)})`;
+          ctx.beginPath(); ctx.arc(s.x, s.y, s.sz*(1-tp), 0, TAU); ctx.fill();
+          ctx.restore();
+        }
+
+        // 8. Main Web Cursor (always on top)
+        drawWebCursor(now);
+      }
+
+      requestAnimationFrame(frame);
+    })();
+    </script>
+  </body>
+</html>
